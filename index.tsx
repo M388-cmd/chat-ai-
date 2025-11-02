@@ -1,10 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ReactDOM from 'react-dom/client';
-import { GoogleGenAI, Chat } from '@google/genai';
+import { GoogleGenAI, Chat, Modality } from '@google/genai';
 
 type Message = {
   role: 'user' | 'gemini';
   content: string;
+  image?: string;
 };
 
 const UserIcon = () => <div className="message-icon profile-avatar">M</div>;
@@ -21,9 +22,12 @@ const App = () => {
   const [history, setHistory] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [file, setFile] = useState<File | null>(null);
+  const [filePreview, setFilePreview] = useState<string | null>(null);
   
   const chatRef = useRef<Chat | null>(null);
   const chatHistoryRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (chatHistoryRef.current) {
@@ -31,33 +35,123 @@ const App = () => {
     }
   }, [history, isLoading]);
 
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = () => {
+            const result = reader.result as string;
+            resolve(result.split(',')[1]);
+        };
+        reader.onerror = error => reject(error);
+    });
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = e.target.files?.[0];
+    if (selectedFile) {
+        setFile(selectedFile);
+        setFilePreview(URL.createObjectURL(selectedFile));
+    }
+  };
+
+  const removeFile = () => {
+    setFile(null);
+    setFilePreview(null);
+    if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputValue.trim() || isLoading) return;
+    const prompt = inputValue.trim();
+    if ((!prompt && !file) || isLoading) return;
 
-    const userMessage: Message = { role: 'user', content: inputValue };
-    setHistory(prev => [...prev, userMessage]);
-    const currentMessage = inputValue;
-    setInputValue('');
     setIsLoading(true);
+    const userMessage: Message = { role: 'user', content: prompt, image: filePreview || undefined };
+    setHistory(prev => [...prev, userMessage]);
+    
+    const currentFile = file;
+    setInputValue('');
+    setFile(null);
+    setFilePreview(null);
+     if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+    }
 
-    try {
-      if (!chatRef.current) {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
-        chatRef.current = ai.chats.create({
-          model: 'gemini-2.5-flash',
-        });
-      }
-      
-      const response = await chatRef.current.sendMessage({ message: currentMessage });
-      const geminiMessage: Message = { role: 'gemini', content: response.text };
-      setHistory(prev => [...prev, geminiMessage]);
-    } catch (error) {
-      console.error(error);
-      const errorMessage: Message = { role: 'gemini', content: 'Sorry, something went wrong. Please try again.' };
-      setHistory(prev => [...prev, errorMessage]);
-    } finally {
-      setIsLoading(false);
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+    
+    const isImageGenerationRequest = prompt.toLowerCase().startsWith('crear imagen') || prompt.toLowerCase().startsWith('generate');
+    const isImageEditingRequest = currentFile && (
+        prompt.toLowerCase().includes('edit') || 
+        prompt.toLowerCase().includes('change') ||
+        prompt.toLowerCase().includes('add') ||
+        prompt.toLowerCase().includes('make') ||
+        prompt.toLowerCase().includes('draw')
+    );
+
+    const isImageTask = currentFile || isImageGenerationRequest;
+    const expectImageResponse = isImageGenerationRequest || isImageEditingRequest;
+    
+    if (isImageTask) {
+        try {
+            const model = 'gemini-2.5-flash-image';
+            const parts: any[] = [];
+
+            if (currentFile) {
+                const base64File = await fileToBase64(currentFile);
+                parts.push({
+                    inlineData: {
+                        mimeType: currentFile.type,
+                        data: base64File,
+                    },
+                });
+            }
+            if (prompt) {
+                parts.push({ text: prompt });
+            }
+
+            const result = await ai.models.generateContent({
+                model,
+                contents: { parts },
+                config: expectImageResponse ? { responseModalities: [Modality.IMAGE] } : {},
+            });
+
+            const response = result;
+            let geminiMessage: Message;
+
+            const imagePart = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData);
+            if (imagePart && imagePart.inlineData) {
+                const imageData = `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`;
+                geminiMessage = { role: 'gemini', content: '', image: imageData };
+            } else {
+                geminiMessage = { role: 'gemini', content: response.text };
+            }
+            setHistory(prev => [...prev, geminiMessage]);
+
+        } catch (error) {
+            console.error(error);
+            const errorMessage: Message = { role: 'gemini', content: 'Sorry, I encountered an error with that request.' };
+            setHistory(prev => [...prev, errorMessage]);
+        } finally {
+            setIsLoading(false);
+        }
+    } else { // Text-only task
+        try {
+            if (!chatRef.current) {
+                chatRef.current = ai.chats.create({ model: 'gemini-2.5-flash' });
+            }
+            const response = await chatRef.current.sendMessage({ message: prompt });
+            const geminiMessage: Message = { role: 'gemini', content: response.text };
+            setHistory(prev => [...prev, geminiMessage]);
+        } catch (error) {
+            console.error(error);
+            const errorMessage: Message = { role: 'gemini', content: 'Sorry, something went wrong. Please try again.' };
+            setHistory(prev => [...prev, errorMessage]);
+        } finally {
+            setIsLoading(false);
+        }
     }
   };
 
@@ -86,12 +180,13 @@ const App = () => {
         <main className="content-area">
           {history.length === 0 ? (
             <div className="welcome-screen">
-                <h1>Hola, Miguel</h1>
+                <h1>Hola, ¿cómo puedo ayudarte?</h1>
                 <div className="suggestion-chips">
                     <div className="chip" onClick={() => handleChipClick('Crear una imagen de un astronauta')}>Crear imagen</div>
                     <div className="chip" onClick={() => handleChipClick('Escribir un poema sobre la lluvia')}>Escribir</div>
                     <div className="chip" onClick={() => handleChipClick('Construir un plan de entrenamiento')}>Construir</div>
                     <div className="chip" onClick={() => handleChipClick('Investigación profunda sobre IA')}>Investigación profunda</div>
+                    <div className="chip" onClick={() => handleChipClick('Aprender sobre la computación cuántica')}>Aprender</div>
                 </div>
             </div>
           ) : (
@@ -100,7 +195,8 @@ const App = () => {
                     <div key={index} className={`message ${msg.role === 'user' ? 'user-message' : 'gemini-message'}`} role="log">
                         {msg.role === 'gemini' ? <GeminiIcon /> : <UserIcon />}
                         <div className="message-content">
-                            <p>{msg.content}</p>
+                            {msg.image && <img src={msg.image} alt="Chat content" className="message-image" />}
+                            {msg.content && <p>{msg.content}</p>}
                         </div>
                     </div>
                 ))}
@@ -114,7 +210,17 @@ const App = () => {
           )}
           
           <div className="chat-input-form-container">
+              {filePreview && (
+                <div className="file-preview">
+                  <img src={filePreview} alt="Preview" />
+                  <button onClick={removeFile} className="remove-file-btn">&times;</button>
+                </div>
+              )}
               <form className="chat-input-form" onSubmit={handleSubmit}>
+                  <button type="button" className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={isLoading} aria-label="Attach file">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 5V19" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"></path><path d="M5 12H19" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"></path></svg>
+                  </button>
+                  <input type="file" ref={fileInputRef} onChange={handleFileChange} style={{ display: 'none' }} accept="image/*" />
                   <input
                       type="text"
                       className="chat-input"
@@ -124,7 +230,7 @@ const App = () => {
                       aria-label="Chat input"
                       disabled={isLoading}
                   />
-                  <button type="submit" className="send-button" disabled={isLoading || !inputValue.trim()}>
+                  <button type="submit" className="send-button" disabled={isLoading || (!inputValue.trim() && !file)}>
                       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                           <path d="M3 12H21" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"></path>
                           <path d="M15 6L21 12L15 18" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"></path>
